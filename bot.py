@@ -1,9 +1,9 @@
 import os
-import logging
 import ast
-import operator
+import operator as op
+import re
 
-from telegram import Update
+from telegram import Update, ChatPermissions
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
@@ -14,157 +14,155 @@ from telegram.ext import (
     filters,
 )
 
+# =========================
+# SETTINGS
+# =========================
+
 TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "10000"))
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+WEBHOOK_PATH = "telegram-webhook"
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(__name__)
+if not RENDER_URL:
+    raise RuntimeError("RENDER_EXTERNAL_URL is not set")
 
 
-# ---------- Calculator ----------
+# =========================
+# START / HELP
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "سلام 👋\n"
+        "من ربات همه‌کاره شما هستم 🤖\n\n"
+        "دستورات:\n"
+        "/start - شروع\n"
+        "/help - راهنما\n"
+        "/id - آیدی شما\n"
+        "/info - معلومات شما\n"
+        "/calc 2+2 - ماشین حساب\n"
+        "/ping - تست ربات\n\n"
+        "دستورات مدیریت گروپ:\n"
+        "/ban - بن کردن عضو\n"
+        "/unban - آزاد کردن عضو\n"
+        "/kick - اخراج عضو\n"
+        "/mute - سکوت عضو\n"
+        "/unmute - رفع سکوت\n"
+        "/del - حذف پیام\n"
+        "/pin - پین پیام\n\n"
+        "برای دستورات مدیریت، روی پیام شخص ریپلای کنید."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏓 ربات فعال است!")
+
+
+# =========================
+# USER INFO
+# =========================
+
+async def user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    await update.message.reply_text(
+        f"👤 نام: {user.full_name}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔗 Username: @{user.username if user.username else 'ندارد'}",
+        parse_mode="Markdown"
+    )
+
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    await update.message.reply_text(
+        f"👤 معلومات کاربر\n\n"
+        f"نام: {user.full_name}\n"
+        f"ID: `{user.id}`\n"
+        f"Username: @{user.username if user.username else 'ندارد'}\n"
+        f"Bot: {'بلی' if user.is_bot else 'نخیر'}",
+        parse_mode="Markdown"
+    )
+
+
+# =========================
+# CALCULATOR
+# =========================
 
 OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-    ast.UAdd: operator.pos,
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.Mod: op.mod,
+    ast.Pow: op.pow,
+    ast.USub: op.neg,
+    ast.UAdd: op.pos,
 }
 
 
-def calculate(expression):
-    def solve(node):
+def safe_calculate(expression):
+    if len(expression) > 100:
+        raise ValueError("عبارت خیلی طولانی است")
+
+    tree = ast.parse(expression, mode="eval")
+
+    def calculate(node):
         if isinstance(node, ast.Expression):
-            return solve(node.body)
+            return calculate(node.body)
 
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float)):
                 return node.value
-            raise ValueError
+            raise ValueError()
 
         if isinstance(node, ast.BinOp):
-            op = OPERATORS.get(type(node.op))
-            if op is None:
-                raise ValueError
-            return op(solve(node.left), solve(node.right))
+            if type(node.op) not in OPERATORS:
+                raise ValueError()
+
+            left = calculate(node.left)
+            right = calculate(node.right)
+
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError()
+
+            return OPERATORS[type(node.op)](left, right)
 
         if isinstance(node, ast.UnaryOp):
-            op = OPERATORS.get(type(node.op))
-            if op is None:
-                raise ValueError
-            return op(solve(node.operand))
+            if type(node.op) not in OPERATORS:
+                raise ValueError()
 
-        raise ValueError
+            return OPERATORS[type(node.op)](calculate(node.operand))
 
-    return solve(ast.parse(expression, mode="eval"))
+        raise ValueError()
 
-
-# ---------- Admin ----------
-
-async def is_admin(update):
-    if update.effective_chat.type == "private":
-        return True
-
-    member = await update.effective_chat.get_member(
-        update.effective_user.id
-    )
-
-    return member.status in (
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.OWNER,
-    )
+    return calculate(tree)
 
 
-def get_reply_user(update):
-    if not update.message or not update.message.reply_to_message:
-        return None
-
-    return update.message.reply_to_message.from_user
-
-
-# ---------- Start ----------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 سلام!\n\n"
-        "من ربات همه‌کاره شما هستم.\n\n"
-        "📌 دستورات عمومی:\n"
-        "/help - راهنما\n"
-        "/id - نمایش ID\n"
-        "/info - اطلاعات کاربر\n"
-        "/calc 10+5 - ماشین حساب\n\n"
-        "🛡 مدیریت گروپ:\n"
-        "/ban - بن کردن کاربر\n"
-        "/unban - رفع بن\n"
-        "/kick - اخراج کاربر\n"
-        "/mute - ساکت کردن کاربر\n"
-        "/unmute - رفع سکوت\n"
-        "/del - حذف پیام\n"
-        "/pin - سنجاق پیام\n\n"
-        "برای دستورات مدیریتی باید ادمین باشی."
-    )
-
-
-async def help_command(update, context):
-    await start(update, context)
-
-
-# ---------- User information ----------
-
-async def user_id(update, context):
-    await update.message.reply_text(
-        f"🆔 User ID: {update.effective_user.id}\n"
-        f"💬 Chat ID: {update.effective_chat.id}"
-    )
-
-
-async def info(update, context):
-    user = update.effective_user
-
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "ندارد"
-    )
-
-    await update.message.reply_text(
-        "👤 اطلاعات کاربر\n\n"
-        f"نام: {user.first_name}\n"
-        f"Username: {username}\n"
-        f"ID: {user.id}"
-    )
-
-
-# ---------- Calculator ----------
-
-async def calc(update, context):
+async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "مثال:\n"
-            "/calc 10+5\n"
-            "/calc (20*3)/2"
+            "مثال:\n/calc 10+5*2"
         )
         return
 
     expression = " ".join(context.args)
 
     try:
-        result = calculate(expression)
-
-        if abs(result) > 10**100:
-            raise ValueError
+        result = safe_calculate(expression)
 
         await update.message.reply_text(
-            f"🧮 نتیجه: {result}"
+            f"🧮 نتیجه:\n`{result}`",
+            parse_mode="Markdown"
         )
 
     except Exception:
@@ -173,62 +171,96 @@ async def calc(update, context):
         )
 
 
-# ---------- Ban ----------
+# =========================
+# ADMIN CHECK
+# =========================
 
-async def ban(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.effective_user:
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(
+            update.effective_chat.id,
+            update.effective_user.id
         )
+
+        return member.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        )
+
+    except Exception:
+        return False
+
+
+async def get_target(update: Update):
+    if not update.message:
+        return None
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "❗ روی پیام شخص مورد نظر ریپلای کن و بعد دستور را بفرست."
+        )
+        return None
+
+    return update.message.reply_to_message.from_user
+
+
+# =========================
+# BAN
+# =========================
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
-    user = get_reply_user(update)
+    target = await get_target(update)
 
-    if not user:
-        await update.message.reply_text(
-            "⚠️ روی پیام کاربر ریپلای کن و /ban بزن."
-        )
+    if not target:
         return
 
     try:
-        await update.effective_chat.ban_member(user.id)
+        await context.bot.ban_chat_member(
+            update.effective_chat.id,
+            target.id
+        )
 
         await update.message.reply_text(
-            f"🚫 {user.first_name} بن شد."
+            f"🚫 {target.full_name} بن شد."
         )
 
     except Exception as e:
-        logger.error(e)
         await update.message.reply_text(
-            "❌ نتوانستم کاربر را بن کنم."
+            "❌ نتوانستم کاربر را بن کنم.\n"
+            "مطمئن شو ربات ادمین است."
         )
 
 
-# ---------- Unban ----------
+# =========================
+# UNBAN
+# =========================
 
-async def unban(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
-        )
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
-    user = get_reply_user(update)
+    target = await get_target(update)
 
-    if not user:
-        await update.message.reply_text(
-            "⚠️ روی پیام کاربر ریپلای کن."
-        )
+    if not target:
         return
 
     try:
-        await update.effective_chat.unban_member(
-            user.id,
+        await context.bot.unban_chat_member(
+            update.effective_chat.id,
+            target.id,
             only_if_banned=True
         )
 
         await update.message.reply_text(
-            f"✅ بن {user.first_name} برداشته شد."
+            f"✅ {target.full_name} آزاد شد."
         )
 
     except Exception:
@@ -237,29 +269,33 @@ async def unban(update, context):
         )
 
 
-# ---------- Kick ----------
+# =========================
+# KICK
+# =========================
 
-async def kick(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
-        )
+async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
-    user = get_reply_user(update)
+    target = await get_target(update)
 
-    if not user:
-        await update.message.reply_text(
-            "⚠️ روی پیام کاربر ریپلای کن."
-        )
+    if not target:
         return
 
     try:
-        await update.effective_chat.ban_member(user.id)
-        await update.effective_chat.unban_member(user.id)
+        await context.bot.ban_chat_member(
+            update.effective_chat.id,
+            target.id
+        )
+
+        await context.bot.unban_chat_member(
+            update.effective_chat.id,
+            target.id
+        )
 
         await update.message.reply_text(
-            f"👢 {user.first_name} اخراج شد."
+            f"👢 {target.full_name} از گروپ اخراج شد."
         )
 
     except Exception:
@@ -268,107 +304,80 @@ async def kick(update, context):
         )
 
 
-# ---------- Mute ----------
+# =========================
+# MUTE
+# =========================
 
-async def mute(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
-        )
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
-    user = get_reply_user(update)
+    target = await get_target(update)
 
-    if not user:
-        await update.message.reply_text(
-            "⚠️ روی پیام کاربر ریپلای کن."
-        )
+    if not target:
         return
 
     try:
-        await update.effective_chat.restrict_member(
-            user.id,
-            permissions={
-                "can_send_messages": False,
-                "can_send_audios": False,
-                "can_send_documents": False,
-                "can_send_photos": False,
-                "can_send_videos": False,
-                "can_send_video_notes": False,
-                "can_send_voice_notes": False,
-                "can_send_polls": False,
-                "can_send_other_messages": False,
-                "can_add_web_page_previews": False,
-            },
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id,
+            target.id,
+            permissions=ChatPermissions.no_permissions()
         )
 
         await update.message.reply_text(
-            f"🔇 {user.first_name} ساکت شد."
+            f"🔇 {target.full_name} ساکت شد."
         )
 
-    except Exception as e:
-        logger.error(e)
+    except Exception:
         await update.message.reply_text(
             "❌ نتوانستم کاربر را mute کنم."
         )
 
 
-# ---------- Unmute ----------
+# =========================
+# UNMUTE
+# =========================
 
-async def unmute(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
-        )
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
-    user = get_reply_user(update)
+    target = await get_target(update)
 
-    if not user:
-        await update.message.reply_text(
-            "⚠️ روی پیام کاربر ریپلای کن."
-        )
+    if not target:
         return
 
     try:
-        await update.effective_chat.restrict_member(
-            user.id,
-            permissions={
-                "can_send_messages": True,
-                "can_send_audios": True,
-                "can_send_documents": True,
-                "can_send_photos": True,
-                "can_send_videos": True,
-                "can_send_video_notes": True,
-                "can_send_voice_notes": True,
-                "can_send_polls": True,
-                "can_send_other_messages": True,
-                "can_add_web_page_previews": True,
-            },
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id,
+            target.id,
+            permissions=ChatPermissions.all_permissions()
         )
 
         await update.message.reply_text(
-            f"🔊 {user.first_name} آزاد شد."
+            f"🔊 {target.full_name} از حالت سکوت خارج شد."
         )
 
     except Exception:
         await update.message.reply_text(
-            "❌ عملیات انجام نشد."
+            "❌ نتوانستم unmute کنم."
         )
 
 
-# ---------- Delete ----------
+# =========================
+# DELETE
+# =========================
 
-async def delete_message(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
-        )
+async def delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
     if not update.message.reply_to_message:
         await update.message.reply_text(
-            "⚠️ روی پیامی که می‌خواهی حذف شود ریپلای کن."
+            "❗ روی پیامی که می‌خواهی حذف شود ریپلای کن."
         )
         return
 
@@ -382,18 +391,18 @@ async def delete_message(update, context):
         )
 
 
-# ---------- Pin ----------
+# =========================
+# PIN
+# =========================
 
-async def pin(update, context):
-    if not await is_admin(update):
-        await update.message.reply_text(
-            "❌ فقط ادمین‌ها می‌توانند."
-        )
+async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ فقط ادمین می‌تواند این کار را انجام دهد.")
         return
 
     if not update.message.reply_to_message:
         await update.message.reply_text(
-            "⚠️ روی پیام موردنظر ریپلای کن."
+            "❗ روی پیامی که می‌خواهی پین شود ریپلای کن."
         )
         return
 
@@ -402,57 +411,71 @@ async def pin(update, context):
             disable_notification=True
         )
 
-        await update.message.reply_text(
-            "📌 پیام سنجاق شد."
-        )
+        await update.message.reply_text("📌 پیام پین شد.")
 
     except Exception:
         await update.message.reply_text(
-            "❌ نتوانستم پیام را سنجاق کنم."
+            "❌ نتوانستم پیام را پین کنم."
         )
 
 
-# ---------- Welcome ----------
+# =========================
+# WELCOME
+# =========================
 
-async def welcome(update, context):
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.chat_member:
         return
 
-    old = update.chat_member.old_chat_member
-    new = update.chat_member.new_chat_member
+    old_status = update.chat_member.old_chat_member.status
+    new_status = update.chat_member.new_chat_member.status
 
-    if (
-        old.status in ("left", "kicked")
-        and new.status in ("member", "administrator")
+    if new_status not in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.RESTRICTED,
     ):
-        try:
-            await context.bot.send_message(
-                update.effective_chat.id,
-                f"👋 خوش آمدی {new.user.first_name}!"
-            )
-        except Exception:
-            pass
+        return
+
+    if old_status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.RESTRICTED,
+    ):
+        return
+
+    user = update.chat_member.new_chat_member.user
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            f"🎉 خوش آمدی {user.mention_html()}!\n"
+            f"به گروپ خوش آمدی ❤️"
+        ),
+        parse_mode="HTML"
+    )
 
 
-# ---------- Anti Link ----------
+# =========================
+# ANTI LINK
+# =========================
 
-async def anti_link(update, context):
+async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if update.effective_chat.type == "private":
+    text = update.message.text or update.message.caption or ""
+
+    if not text:
         return
 
-    text = update.message.text or ""
+    link_pattern = r"(https?://|www\.|t\.me/|telegram\.me/)"
 
-    if not any(
-        x in text.lower()
-        for x in ("http://", "https://", "t.me/")
-    ):
+    if not re.search(link_pattern, text, re.IGNORECASE):
         return
 
+    # ادمین‌ها را حذف نکن
     try:
-        member = await update.effective_chat.get_member(
+        member = await context.bot.get_chat_member(
+            update.effective_chat.id,
             update.effective_user.id
         )
 
@@ -468,43 +491,74 @@ async def anti_link(update, context):
         pass
 
 
-# ---------- Main ----------
+# =========================
+# ERROR HANDLER
+# =========================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("ERROR:", context.error)
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
-    app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("id", user_id))
-    app.add_handler(CommandHandler("info", info))
-    app.add_handler(CommandHandler("calc", calc))
+    # Commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("id", user_id))
+    application.add_handler(CommandHandler("info", info))
+    application.add_handler(CommandHandler("calc", calc))
 
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("unban", unban))
-    app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("unmute", unmute))
-    app.add_handler(CommandHandler("del", delete_message))
-    app.add_handler(CommandHandler("pin", pin))
+    # Admin commands
+    application.add_handler(CommandHandler("ban", ban))
+    application.add_handler(CommandHandler("unban", unban))
+    application.add_handler(CommandHandler("kick", kick))
+    application.add_handler(CommandHandler("mute", mute))
+    application.add_handler(CommandHandler("unmute", unmute))
+    application.add_handler(CommandHandler("del", delete_message))
+    application.add_handler(CommandHandler("pin", pin_message))
 
-    app.add_handler(
+    # Welcome
+    application.add_handler(
         ChatMemberHandler(
             welcome,
             ChatMemberHandler.CHAT_MEMBER
         )
     )
 
-    app.add_handler(
+    # Anti-link
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             anti_link
         )
     )
 
-    print("🤖 Bot is running...")
+    application.add_error_handler(error_handler)
 
-    app.run_polling(
+    webhook_url = f"{RENDER_URL.rstrip('/')}/{WEBHOOK_PATH}"
+
+    print("================================")
+    print("BOT STARTED")
+    print("Webhook:", webhook_url)
+    print("Port:", PORT)
+    print("================================")
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=webhook_url,
         drop_pending_updates=True
     )
 
